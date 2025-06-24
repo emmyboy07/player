@@ -8,7 +8,8 @@ app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, '..', 'views'));
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
-app.get('/watch', async (req, res) => {
+// IMPORTANT: Use '/' so it works as /api/watch (rewritten from /watch)
+app.get('/', async (req, res) => {
   const { type, id } = req.query;
   let imdbId = null, seasonNumber = null, episodeNumber = null, subtitleUrl = null, title = 'Untitled';
 
