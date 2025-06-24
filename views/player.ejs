@@ -303,6 +303,8 @@
       .player-title { top: 16px; font-size: 1.1rem; }
       .progress-bar-container, .bottom-bar-inner { max-width: 98vw; }
     }
+    #subtitle-preview-modal { animation: fadeIn 0.2s; }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
   </style>
 </head>
 <body>
@@ -556,9 +558,12 @@
     let subtitleApiUrl = "<%= subtitleUrl || '' %>"; // Provided by server (wyzie.ru API endpoint)
     let subtitleOptions = [];
 
+    // Helper to add and show subtitle track
     function addSubtitleTrack(url, label, lang, isDefault) {
-      // Remove old track
-      if (currentSubtitleTrack) currentSubtitleTrack.remove();
+      // Remove all <track> elements you added (not HLS ones)
+      Array.from(video.querySelectorAll('track')).forEach(track => track.remove());
+
+      // Add the new track
       const track = document.createElement('track');
       track.kind = 'subtitles';
       track.label = label;
@@ -567,11 +572,60 @@
       if (isDefault) track.default = true;
       video.appendChild(track);
       currentSubtitleTrack = track;
-      // Show subtitles
+
+      // When the track loads, disable all textTracks except the last one (the one just added)
       track.addEventListener('load', () => {
-        if (video.textTracks.length > 0) video.textTracks[video.textTracks.length-1].mode = 'showing';
+        if (video.textTracks && video.textTracks.length > 0) {
+          for (let i = 0; i < video.textTracks.length; i++) {
+            video.textTracks[i].mode = 'disabled';
+          }
+          // The last textTrack is the one you just added
+          video.textTracks[video.textTracks.length - 1].mode = 'showing';
+        }
       });
+
+      // In case the track loads instantly, also run this after a short delay
+      setTimeout(() => {
+        if (video.textTracks && video.textTracks.length > 0) {
+          for (let i = 0; i < video.textTracks.length; i++) {
+            video.textTracks[i].mode = 'disabled';
+          }
+          video.textTracks[video.textTracks.length - 1].mode = 'showing';
+        }
+      }, 500);
     }
+
+    // Helper to auto-select and load English subtitle on video load
+    async function autoLoadEnglishSubtitle() {
+      if (!subtitleApiUrl) return;
+      try {
+        // Try direct fetch first, then fallback to proxy
+        let res;
+        try {
+          res = await fetch(subtitleApiUrl);
+          if (!res.ok) throw new Error('Direct fetch failed');
+        } catch {
+          res = await fetch(`/api/subtitles?url=${encodeURIComponent(subtitleApiUrl)}`);
+          if (!res.ok) throw new Error('Proxy fetch failed');
+        }
+        let data = await res.json();
+        if (Array.isArray(data) && data.length > 0) {
+          // Find English subtitle
+          let eng = data.find(sub => sub.language === 'en' || sub.label === 'English' || /english/i.test(sub.display));
+          if (eng) {
+            addSubtitleTrack(eng.url, eng.display, eng.language, true);
+          } else {
+            // Fallback to first available
+            addSubtitleTrack(data[0].url, data[0].display, data[0].language, true);
+          }
+        }
+      } catch (e) {
+        // Ignore errors for auto-load
+      }
+    }
+
+    // Call auto-load when video is ready
+    video.addEventListener('loadedmetadata', autoLoadEnglishSubtitle);
 
     // Open subtitle popup and fetch options
     subToggleBtn.addEventListener('click', async () => {
@@ -582,17 +636,13 @@
       subtitlePopup.style.display = 'flex';
       subtitleList.innerHTML = 'Loading...';
 
-      try {
-        const res = await fetch(`/api/subtitles?url=${encodeURIComponent(subtitleApiUrl)}`);
-        const data = await res.json();
+      // Helper to render the list
+      function renderSubtitleList(data) {
         subtitleOptions = data;
-
         if (!Array.isArray(data) || data.length === 0) {
           subtitleList.innerHTML = '<div style="padding:12px;">No subtitles found.</div>';
           return;
         }
-
-        // Build list
         subtitleList.innerHTML = '';
         let englishFound = false;
         data.forEach((sub, idx) => {
@@ -617,28 +667,54 @@
             <span>${sub.display}</span>
             ${sub.isHearingImpaired ? '<span style="font-size:0.9em;color:#e50914;">CC</span>' : ''}
           `;
-          btn.onclick = () => {
-            addSubtitleTrack(sub.url, sub.display, sub.language, true);
+          btn.onclick = async () => {
             subtitlePopup.style.display = 'none';
+            // Fetch subtitle file for preview
+            try {
+              let res = await fetch(sub.url);
+              if (!res.ok) throw new Error('Failed to fetch subtitle file');
+              let srtText = await res.text();
+              let preview = parseSrtPreview(srtText);
+              showSubtitlePreview(preview, () => {
+                addSubtitleTrack(sub.url, sub.display, sub.language, true);
+              });
+            } catch (e) {
+              alert('Failed to preview subtitle.');
+              addSubtitleTrack(sub.url, sub.display, sub.language, true);
+            }
           };
           subtitleList.appendChild(btn);
 
           // Select English by default
           if (!englishFound && (sub.language === 'en' || sub.label === 'English')) {
             englishFound = true;
-            // If first open, auto-select English
             if (!currentSubtitleTrack) {
               addSubtitleTrack(sub.url, sub.display, sub.language, true);
             }
           }
         });
-
         // If no English, select first by default
         if (!englishFound && data.length > 0 && !currentSubtitleTrack) {
           addSubtitleTrack(data[0].url, data[0].display, data[0].language, true);
         }
+      }
+
+      // Try direct fetch first, then fallback to proxy
+      try {
+        let res = await fetch(subtitleApiUrl);
+        if (!res.ok) throw new Error('Direct fetch failed');
+        let data = await res.json();
+        renderSubtitleList(data);
       } catch (e) {
-        subtitleList.innerHTML = '<div style="padding:12px;">Failed to load subtitles.</div>';
+        // Fallback to proxy
+        try {
+          let res = await fetch(`/api/subtitles?url=${encodeURIComponent(subtitleApiUrl)}`);
+          if (!res.ok) throw new Error('Proxy fetch failed');
+          let data = await res.json();
+          renderSubtitleList(data);
+        } catch (err) {
+          subtitleList.innerHTML = '<div style="padding:12px;">Failed to load subtitles.</div>';
+        }
       }
     });
 
@@ -653,6 +729,57 @@
         subtitlePopup.style.display = 'none';
       }
     });
+
+    // Helper to parse SRT and get a preview
+    function parseSrtPreview(srtText, maxLines = 6) {
+      // Remove SRT numbering and timestamps, keep only text lines
+      return srtText
+        .replace(/\r/g, '')
+        .split('\n')
+        .filter(line => line && !/^\d+$/.test(line) && !/^\d{2}:\d{2}:\d{2},\d{3}/.test(line))
+        .slice(0, maxLines)
+        .join('\n');
+    }
+
+    // Create a modal for preview
+    function showSubtitlePreview(previewText, onConfirm) {
+      // Remove any existing preview modal
+      let old = document.getElementById('subtitle-preview-modal');
+      if (old) old.remove();
+
+      const modal = document.createElement('div');
+      modal.id = 'subtitle-preview-modal';
+      modal.style.position = 'fixed';
+      modal.style.left = '0';
+      modal.style.top = '0';
+      modal.style.width = '100vw';
+      modal.style.height = '100vh';
+      modal.style.background = 'rgba(0,0,0,0.7)';
+      modal.style.zIndex = '1001';
+      modal.style.display = 'flex';
+      modal.style.alignItems = 'center';
+      modal.style.justifyContent = 'center';
+
+      modal.innerHTML = `
+        <div style="background:#181818; border-radius:12px; padding:24px 16px; max-width:95vw; max-height:80vh; overflow-y:auto; box-shadow:0 4px 32px #000; color:#fff;">
+          <h3 style="margin:0 0 16px 0; font-size:1.2rem;">Subtitle Preview</h3>
+          <pre style="background:#222; color:#fff; padding:12px; border-radius:8px; font-size:1.05em; max-width:80vw; max-height:40vh; overflow:auto;">${previewText}</pre>
+          <div style="margin-top:18px; display:flex; gap:12px; justify-content:flex-end;">
+            <button id="subtitle-preview-confirm" style="background:#e50914; color:#fff; border:none; border-radius:6px; padding:8px 18px; font-size:1rem; cursor:pointer;">Use Subtitle</button>
+            <button id="subtitle-preview-cancel" style="background:#444; color:#fff; border:none; border-radius:6px; padding:8px 18px; font-size:1rem; cursor:pointer;">Cancel</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(modal);
+
+      document.getElementById('subtitle-preview-confirm').onclick = () => {
+        modal.remove();
+        onConfirm();
+      };
+      document.getElementById('subtitle-preview-cancel').onclick = () => {
+        modal.remove();
+      };
+    }
   </script>
 </body>
 </html>
